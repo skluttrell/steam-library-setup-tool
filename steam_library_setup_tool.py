@@ -1,309 +1,224 @@
-'''
-steam-library-setup-tool.py
+import collections, os, re, psutil, winreg, wx
+from shutil import copy
+from sys import exit
 
-Small tool to add additional library folders to Steam
+class SteamIsRunning(wx.Dialog):
+	""" A custome dialog to show if Steam processes are running """
 
-Copyright (c) 2018 by LostDragonist
-Distributed under the MIT License
-'''
-import collections
-import os
-import re
-import tkinter as tk
-import tkinter.filedialog as filedialog
-import tkinter.messagebox as messagebox
-import winreg
+	def __init__(self, parent):
+		super(SteamIsRunning, self).__init__(parent, title='Alert')
+		panel = wx.Panel(self)
+		self.msg = wx.StaticText(panel, wx.ID_ANY, 'Cannot proceed because Steam is running in the background. Please close the program and try again or override this check (not recommended).')
+		self.tryButton = wx.Button(panel, wx.ID_OK, label='Try Again')
+		self.OverrideButton = wx.Button(panel, wx.ID_CANCEL, label='Override')
 
-info_t = collections.namedtuple( "info_t", ( "key", "value" ) )
+class Window(wx.Frame):
+	""" The main program window (frame) """
 
-class SteamLibrarySetupTool( tk.Frame ):
+	def CheckForProcess(self, process):
+		""" Checks to see if a given process is running """
 
-    COL_ENTRY  = 0
-    COL_PATH   = 1
-    COL_BROWSE = 2
-    COL_DELETE = 3
-    COL_NEW    = 3
-    COL_ACCEPT = 0
-    COL_CANCEL = 0
+		for p in psutil.process_iter():
+			try:
+				if p.name() == process:
+					return True
+			except:
+				continue
+		return False
 
-    def __init__( self, master=None ):
-        # Initialize tkinter
-        tk.Frame.__init__( self, master )
+	def FindSteamDirectory(self):
+		""" Tries to locate the Steam directory """
 
-        # Try to read the registry for the location of Steam
-        try:
-            with winreg.OpenKey( winreg.HKEY_CURRENT_USER, "Software\\Valve\\Steam" ) as key:
-                value = winreg.QueryValueEx( key, "SteamExe" )
-                self.steam_path = value[0].replace( "/", "\\" )
-        except:
-            self.steam_path = ''
+		try:
+			with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Software\\Valve\\Steam') as k:
+				# Acquires the steam executable location from the SteamKey located in the registry, then converts the slashes to backslashes, and finally strips the steam.exe file name from the end with os.path.dirname to get the root directory
+				return os.path.dirname(winreg.QueryValueEx(k, 'SteamExe')[0].replace('/', '\\'))
+		except:
+			# Don't return anything if it fails to locate the registry key
+			return
 
-        # Prompt user for location of steam.exe if the registry wasn't useful
-        if self.steam_path == '' or not os.path.exists( self.steam_path ):
-            dialog = filedialog.Open( self, defaultextension='.exe', initialdir=os.path.join( "C:\\", "Program Files (x86)", "Steam" ),
-                                    initialfile="Steam.exe", title="Select Steam.exe", filetypes=(("Steam", "Steam.exe"),) )
-            self.steam_path = dialog.show().replace( "/", "\\" )
+	def backup(self, file):
+		""" Makes a backup copy of a given file """
+		bFile = file + '.old' # add ".old" to the end of the file
+		count = 1
+		# If the file "whatever.old" already exists, I don't want to overwrite it.
+		# So I added this loop here to add a number after the subsequent .olds to distinguish them.
+		while os.path.exists(bFile):
+			bFile += '.' + str(count)
+			count += 1
+		copy(file, bFile) # Finally make a backup copy of the file
 
-        if self.steam_path == '':
-            messagebox.showerror( "Error", "Could not find Steam.exe" )
-            raise ValueError( "Could not find steam.exe" )
+	def isReady(self):
+		""" Checks if Steam is running in the background and gathers some startup info. Note: user can overide this behavior (Not recommended). """
 
-        # Make sure libraryfolders.vdf exists where we think it should
-        self.library_vdf_path = os.path.join( os.path.split( self.steam_path )[ 0 ], "steamapps", "libraryfolders.vdf" )
-        if not os.path.exists( self.library_vdf_path ):
-            messagebox.showerror( "Error", "Could not find libraryfolders.vdf" )
-            raise ValueError( "Could not find libraryfolders.vdf" )
+		# looks to see if steam.exe is a running process
+		if self.CheckForProcess('steam.exe'):
+			# If Steam is running, give the user a chance to shut it down or proceed anyway (override)
+			with SteamIsRunning(self) as dlg:
+				if dlg.ShowModal() == wx.ID_OK:
+					self.isReady()
 
-        # Parse libraryfolders.vdf
-        self.library_info = {}
-        self.library_folders = []
-        self.parseLibraryInfo()
+		# Get the directory for Steam
+		self.steamPath = self.FindSteamDirectory()
+		if not self.steamPath:
+			with wx.DirDialog(self, 'Please select the directory where steam.exe resides', wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST) as dlg:
+				if dlg.ShowModal() == wx.ID_OK:
+					self.steamPath = dlg.GetPath()
+				else:
+					with wx.MessageDialog(self, 'Cannot proceed because the Steam folder could not be located.', 'Alert', wx.OK | wx.ICON_WARNING) as dlg:
+						dlg.ShowModal()
+					exit(0)
 
-        # Initialize GUI stuff
-        self.deleteRowButtons = []
-        self.browseRowButtons = []
-        self.entryLabels = []
-        self.entryWidgets = []
+		# Ensure that the Steam libraryfolders.vdf file exists
+		self.vdfFile = os.path.join(self.steamPath, 'steamapps', 'libraryfolders.vdf')
+		if not os.path.exists(self.vdfFile):
+			with wx.MessageDialog(self, 'Cannot proceed because a necessary file (libraryfolder.vdf) could not be located.', 'Alert', wx.OK | wx.ICON_WARNING) as dlg:
+				dlg.ShowModal()
+			exit(0)
 
-        self.entryValues = [ tk.StringVar() ]
-        self.entryValues[ 0 ].set( self.steam_path.replace( "\\\\", "\\" ) )
-        for info in self.library_folders:
-            self.entryValues.append( tk.StringVar() )
-            self.entryValues[ -1 ].set( info.value.replace( "\\\\", "\\" ) )
+		# Acquire any existing library folders
+		info_t = collections.namedtuple( "info_t", ( "key", "value" ) )
+		parent = ""
+		libFolders = []
 
-        self.grid()
-        self.createWidgets()
+		with open(self.vdfFile, 'r') as inFile:
+			for line in inFile:
+				# Match for the parent item
+				# This identifies the heading for a new group of key/value pairs
+				match = re.match("^\"(.*)\"$", line)
+				if match:
+					parent = match.group( 1 )
+					continue
 
-    def parseLibraryInfo( self ):
-        parent = ""
-        next_parent = ""
-        with open( self.library_vdf_path, 'r' ) as f:
-            for line in f:
-                # Match for the parent item
-                match = re.match( "^\"(.*)\"$", line )
-                if match:
-                    next_parent = match.group( 1 )
-                    continue
+				# Match for key and value
+				match = re.match("^\s*\"(.*)\"\s*\"(.*)\"$", line)
+				if match:
+					if parent not in self.libInfo:
+						self.libInfo[parent] = []
+					self.libInfo[parent].append(info_t(key=match.group(1), value=match.group(2)))
+					continue
 
-                # Match for opening brace
-                match = re.match( "^{$", line )
-                if match:
-                    parent = next_parent
-                    next_parent = ""
-                    continue
+		# Find the library folders
+		for info in self.libInfo[ "LibraryFolders" ]:
+			try:
+				folder_id = int( info.key ) # Non integer values (strings) throw an exception: meaning this is not a library path value (it's some other necessary thing for Steam)
+				libFolders.append(info) # Only keys with integers will make it here because those are actual library folders
+				self.libPathsList.Append(info.value) # Place the folders in the list box control
+			except ValueError:
+				pass # ignore and move on to the next
 
-                # Match for closing brace
-                match = re.match( "^}$", line )
-                if match:
-                    parent = ""
-                    continue
+		# Remove the library folders from the library info
+		# They'll be added back in later
+		for folder in libFolders:
+			self.libInfo["LibraryFolders"].remove(folder)
 
-                # Match for key and value
-                match = re.match( "^\\s*\"(.*)\"\\s*\"(.*)\"$", line )
-                if match:
-                    if parent not in self.library_info:
-                        self.library_info[ parent ] = []
-                    self.library_info[ parent ].append( info_t( key=match.group( 1 ), value=match.group( 2 ) ) )
-                    continue
+	# Initialize the main program window (frame)
+	def __init__(self, parent, title):
+		super(Window, self).__init__(parent, title=title)
+		panel = wx.Panel(self)
+		mainSizer = wx.BoxSizer(wx.VERTICAL)
+		buttonsSizer = wx.BoxSizer(wx.HORIZONTAL)
+		self.steamPath = '' # The directory where steam resides
+		self.vdfFile = '' # The configuration file that tells Steam what folders are available to use for game installations
+		self.libInfo = {} # A copy of the information from the VDF file
 
-        # Find the library folders
-        for info in self.library_info[ "LibraryFolders" ]:
-            try:
-                folder_id = int( info.key )
-                self.library_folders.append( info )
-            except ValueError:
-                pass
+		# Initialize the user interface elements
+		self.libPathsList = wx.ListBox(panel) # List box to show the library paths
+		self.acceptButton = wx.Button(panel, label='Accept') # Commit the changes to the VDF file
+		self.addButton = wx.Button(panel, label='Add') # Add a new library path
+		self.addButton.SetFocus() # Set this button as the focus when the app opens
+		self.removeButton = wx.Button(panel, label='Remove') # Removes a path from the library paths list
+		self.exitButton = wx.Button(panel, label='Exit') # Closes the app without committing any changes
 
-        # Remove the library folders from the library info
-        # They'll be added back in later
-        for folder in self.library_folders:
-            self.library_info[ "LibraryFolders" ].remove( folder )
+		# link the elements to the sizers
+		buttonsSizer.Add(self.acceptButton, 1, wx.EXPAND)
+		buttonsSizer.Add(self.addButton, 1, wx.EXPAND)
+		buttonsSizer.Add(self.removeButton, 1, wx.EXPAND)
+		buttonsSizer.Add(self.exitButton, 1, wx.EXPAND)
+		mainSizer.Add(self.libPathsList, 1, wx.EXPAND)
+		mainSizer.Add(buttonsSizer, 1, wx.EXPAND)
 
-    def writeLibraryInfo( self ):
-        # Make sure directories all exist
-        for folder in self.library_folders:
-            new_folder = os.path.join( folder.value, "steamapps" )
-            if not os.path.exists( new_folder ):
-                if messagebox.askyesno("Create folders?", "Do you want to create the directory \"{}\"?".format( new_folder ) ):
-                    try:
-                        os.makedirs( new_folder, exist_ok=True )
-                    except:
-                        messagebox.showerror( "Error", "Error when creating directories" )
-                        raise
-                else:
-                    messagebox.showerror( "Error", "Can not proceed without creating directories" )
-                    raise ValueError( "Can not proceed without creating directories" )
+		# Bind the event listeners to their respective controls
+		self.acceptButton.Bind(wx.EVT_BUTTON, self.OnAccept)
+		self.addButton.Bind(wx.EVT_BUTTON, self.OnOpen)
+		self.removeButton.Bind(wx.EVT_BUTTON, self.OnRemoveItem)
+		self.exitButton.Bind(wx.EVT_BUTTON, self.OnExit)
 
-        # Add the library folders back to the library info
-        for i, folder in enumerate( self.library_folders ):
-            self.library_info[ "LibraryFolders" ].append( info_t( key=i+1, value=folder.value.replace( "\\", "\\\\" ) ) )
+		# Set the sizer size and position
+		panel.SetSizer(mainSizer)
+		self.SetAutoLayout(1)
+		mainSizer.Fit(self)
 
-        # Create a backup
-        try:
-            with open( self.library_vdf_path, 'r' ) as f_in:
-                with open( self.library_vdf_path + '.bak', 'w' ) as f_out:
-                    f_out.write( f_in.read() )
-        except:
-            if not messagebox.askyesno( "Warning", "Failed to create a backup.  Proceed anyways?" ):
-                raise
+		self.isReady() # Initialize the program
+		self.Show() # Start the main window (frame)
 
-        # Open the new file
-        restore_backup = False
-        try:
-            with open( self.library_vdf_path, 'w' ) as f:
-                for parent in self.library_info:
-                    f.write( "\"{}\"\n".format( parent ) )
-                    f.write( "{\n" )
-                    for info in self.library_info[ parent ]:
-                        f.write( "\t\"{}\"\t\t\"{}\"\n".format( info.key, info.value ) )
-                    f.write( "}\n" )
-        except:
-            restore_backup = True
+	# The event handlers
 
-        # Restore the backup if needed
-        if restore_backup:
-            messagebox.showerror( "Error", "Failed to write libraryfolders.vdf.  Restoring backup..." )
-            try:
-                with open( self.library_vdf_path + '.bak', 'r' ) as f_in:
-                    with open( self.library_vdf_path, 'w' ) as f_out:
-                        f_out.write( f_in.read() )
-            except:
-                messagebox.showerror( "Error", "Failed to restore backup!  Sorry about that." )
-                raise
+	def OnAccept(self, e):
+		""" Commits the changes """
 
-        # Tell the user stuff is done
-        messagebox.showinfo( "Complete", "Steam Library Setup is done.  Closing program..." )
-        self.quit()
+		# Check to see if there are any folders to add
+		if self.libPathsList.GetCount() == 0:
+			with wx.MessageDialog(self, 'Cannot proceed because there are no folders to add. Please add folders befor clicking accept.', 'Alert', wx.OK) as dlg:
+				dlg.ShowModal()
+			return
 
-    def acceptEvent( self ):
-        # Parse the new directories list
-        self.library_folders = []
-        for i, entry in enumerate( self.entryValues ):
-            # Skip the base Steam directory
-            if i == 0:
-                continue
+		info_t = collections.namedtuple( "info_t", ( "key", "value" ) )
 
-            # Skip empty rows
-            value = entry.get()
-            if not value:
-                continue
+		self.backup(self.vdfFile) # We are about to make changes to an important file. Back it up!
 
-            self.library_folders.append( info_t( key="{}".format( len( self.library_folders ) + 1 ), value=value ) )
+		# Add the library folders back to the library info
+		for i, folder in enumerate(self.libPathsList.GetStrings()):
+			self.libInfo["LibraryFolders"].append(info_t(key=i+1, value=folder.replace("\\", "\\\\")))
 
-        # Write the library info
-        self.writeLibraryInfo()
+		with open(self.vdfFile, 'w') as outFile:
+			for parent in self.libInfo:
+				outFile.write("\"{}\"\n".format(parent))
+				outFile.write("{\n")
+				for i, info in enumerate(self.libInfo[parent]):
+					outFile.write("\t\"{}\"\t\t\"{}\"\n".format(info.key, info.value))
+					if parent == "LibraryFolders":
+						# Remove each folder from the libInfo list again incase the user wants to change a folder.
+						try:
+							folder_id = int(info.key)
+							self.libInfo[parent].pop(i)
+						except:
+							pass
+				outFile.write("}\n")
 
-    def cancelEvent( self ):
-        if messagebox.askyesno( "Cancel", "Cancel all pending changes and quit?" ):
-            self.quit()
+		# Show a success message
+			with wx.MessageDialog(self, 'The library folders were successfully added.', 'Alert', wx.OK) as dlg:
+				dlg.ShowModal()
 
-    def createWidgets( self ):
-        # Create some headers
-        label_header_entry = tk.Label( self, text="Entry" )
-        label_header_entry.grid( row=0, column=0 )
-        label_header_path = tk.Label( self, text="Path" )
-        label_header_path.grid( row=0, column=1 )
+	def OnOpen(self, e):
+		""" Opens a directory dialog for selecting a folder and adds the folder to the list """
 
-        # Create the rows for each entry
-        # i+1 due to header row
-        for i, entry_var in enumerate( self.entryValues ):
-            self.entryLabels.append( tk.Label( self, text=str( i ) ) )
-            self.entryLabels[ -1 ].grid( row=i+1, column=0 )
+		with wx.DirDialog(self, 'Choose A Folder', self.steamPath, wx.DD_DEFAULT_STYLE) as dlg:
+			if dlg.ShowModal() == wx.ID_OK:
+				self.libPathsList.Append(dlg.GetPath())
 
-            # Github issue #1: Deleting libraries that already exist doesn't work for some reason.
-            #                  The workaround for now is disabling the ability to modify or delete
-            #                  those libraries.
+	def OnRemoveItem(self, e):
+		""" Removes a folder from the list """
 
-            # i == 0 as the base Steam directory can not be modified
-            #self.entryWidgets.append( tk.Entry( self, textvariable=entry_var, state=tk.DISABLED if i == 0 else tk.NORMAL, width=100 ) )
-            self.entryWidgets.append( tk.Entry( self, textvariable=entry_var, state=tk.DISABLED, width=100 ) )
-            self.entryWidgets[ -1 ].grid( row=i+1, column=1 )
+		# Check to see if there are any folders to remove. If not, throw an alert.
+		if self.libPathsList.GetCount() <= 0:
+			with wx.MessageDialog(self, 'Cannot proceed because there are no folders to remove.', 'Alert', wx.OK | wx.ICON_WARNING) as dlg:
+				dlg.ShowModal()
+			return
 
-            # i > 0 as the first row is the base Steam directory and can not be modified
-            #if i > 0:
-            #    self.browseRowButtons.append( tk.Button( self, text="Browse...", command=lambda row=i: self.browseRow( row ) ) )
-            #    self.browseRowButtons[ -1 ].grid( row=i+1, column=SteamLibrarySetupTool.COL_BROWSE )
-            #
-            #    self.deleteRowButtons.append( tk.Button( self, text="Delete Row", command=lambda row=i: self.deleteRow( row ) ) )
-            #    self.deleteRowButtons[ -1 ].grid( row=i+1, column=SteamLibrarySetupTool.COL_DELETE )
+		# Check to see if a folder has been selected. If not, throw alert.
+		if self.libPathsList.GetSelection():
+			with wx.MessageDialog(self, 'Cannot proceed because you have not selected a folder to remove.', 'Alert', wx.OK) as dlg:
+				dlg.ShowModal()
+			return
 
-        # Create the general buttons
-        self.acceptButton = tk.Button( self, text="Accept", command=self.acceptEvent )
-        self.acceptButton.grid( row=len( self.entryValues )+1, column=SteamLibrarySetupTool.COL_ACCEPT, sticky=tk.N+tk.E+tk.S+tk.W )
+		if self.libPathsList.GetSelection() >= 0:
+			self.libPathsList.Delete(self.libPathsList.GetSelection())
 
-        self.newRowButton = tk.Button( self, text="Add Row", command=self.addRow )
-        self.newRowButton.grid( row=len( self.entryValues )+1, column=SteamLibrarySetupTool.COL_NEW, sticky=tk.N+tk.E+tk.S+tk.W )
+	def OnExit(self, e):
+		self.Close(True) # Close the frame
+		exit(0)
 
-        self.cancelButton = tk.Button( self, text="Cancel", command=self.cancelEvent )
-        self.cancelButton.grid( row=len( self.entryValues )+2, column=SteamLibrarySetupTool.COL_CANCEL, sticky=tk.N+tk.E+tk.S+tk.W )
-
-    def addRow( self ):
-        # Create a new row
-        self.entryValues.append( tk.StringVar() )
-        i = len( self.entryValues )
-        self.entryLabels.append( tk.Label( self, text=str( i-1 ) ) )
-        self.entryLabels[ -1 ].grid( row=i, column=0 )
-
-        self.entryWidgets.append( tk.Entry( self, textvariable=self.entryValues[ -1 ], width=100 ) )
-        self.entryWidgets[ -1 ].grid( row=i, column=1 )
-
-        self.browseRowButtons.append( tk.Button( self, text="Browse...", command=lambda row=i-1: self.browseRow( row ) ) )
-        self.browseRowButtons[ -1 ].grid( row=i, column=SteamLibrarySetupTool.COL_BROWSE, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        self.deleteRowButtons.append( tk.Button( self, text="Delete Row", command=lambda row=i-1: self.deleteRow( row ) ) )
-        self.deleteRowButtons[ -1 ].grid( row=i, column=SteamLibrarySetupTool.COL_DELETE, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        # Relocate the general buttons
-        self.acceptButton.grid_remove()
-        self.acceptButton.grid( row=i+1, column=SteamLibrarySetupTool.COL_ACCEPT, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        self.newRowButton.grid_remove()
-        self.newRowButton.grid( row=i+1, column=SteamLibrarySetupTool.COL_NEW, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        self.cancelButton.grid_remove()
-        self.cancelButton.grid( row=i+2, column=SteamLibrarySetupTool.COL_CANCEL, sticky=tk.N+tk.E+tk.S+tk.W )
-
-    def deleteRow( self, row_to_delete ):
-        # Shift the contents from x to N
-        for row in range( row_to_delete, len( self.entryValues ) ):
-            if row+1 < len( self.entryValues ):
-                self.entryValues[ row ].set( self.entryValues[ row+1 ].get() )
-        self.entryValues.pop()
-
-        # Remove the row
-        self.entryLabels[ -1 ].grid_remove()
-        self.entryLabels.pop()
-
-        self.entryWidgets[ -1 ].grid_remove()
-        self.entryWidgets.pop()
-
-        self.browseRowButtons[ -1 ].grid_remove()
-        self.browseRowButtons.pop()
-
-        self.deleteRowButtons[ -1 ].grid_remove()
-        self.deleteRowButtons.pop()
-
-        # Relocate the general buttons
-        self.acceptButton.grid_remove()
-        self.acceptButton.grid( row=row+1, column=SteamLibrarySetupTool.COL_ACCEPT, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        self.newRowButton.grid_remove()
-        self.newRowButton.grid( row=row+1, column=SteamLibrarySetupTool.COL_NEW, sticky=tk.N+tk.E+tk.S+tk.W )
-
-        self.cancelButton.grid_remove()
-        self.cancelButton.grid( row=row+3, column=SteamLibrarySetupTool.COL_CANCEL, sticky=tk.N+tk.E+tk.S+tk.W )
-
-    def browseRow( self, row ):
-        # Open a dialog to find a directory
-        new_path = filedialog.Directory( self ).show()
-
-        # Remove "\\steamapps" if the user selected it
-        if new_path.lower().endswith( "\\steamapps" ):
-            new_path = os.path.split( new_path )[ 0 ]
-
-        # Replace "/" with "\\" to keep things consistent
-        self.entryValues[ row ].set( new_path.replace( "/", "\\" ) )
-
-app = SteamLibrarySetupTool()
-app.master.title( "Steam Library Setup Tool" )
-app.mainloop()
+app = wx.App(False) # Creates a new app and does not redirect stdout or stderr
+frame = Window(None, 'Steam Library Setup Tool') # A frame is a top level window
+app.MainLoop()
